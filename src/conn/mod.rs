@@ -7,7 +7,7 @@
 // modified, or distributed except according to those terms.
 
 use futures_util::FutureExt;
-pub use mysql_common::named_params;
+//pub use mysql_common::named_params;
 
 use mysql_common::{
     constants::{DEFAULT_MAX_ALLOWED_PACKET, UTF8MB4_GENERAL_CI, UTF8_GENERAL_CI},
@@ -564,15 +564,7 @@ impl Conn {
             .auth_plugin
             .gen_data(self.inner.opts.pass(), &self.inner.nonce);
 
-        let handshake_response = HandshakeResponse::new(
-            auth_data.as_deref(),
-            self.inner.version,
-            self.inner.opts.user().map(|x| x.as_bytes()),
-            self.inner.opts.db_name().map(|x| x.as_bytes()),
-            Some(self.inner.auth_plugin.borrow()),
-            self.capabilities(),
-            Default::default(), // TODO: Add support
-        );
+        let handshake_response = HandshakeResponse::new(auth_data.as_deref(), self.inner.version, self.inner.opts.user().map(|x| x.as_bytes()), self.inner.opts.db_name().map(|x| x.as_bytes()), Some(self.inner.auth_plugin.borrow()), self.capabilities(), Default::default(),1024*1024*1024);
 
         // Serialize here to satisfy borrow checker.
         let mut buf = crate::BUFFER_POOL.get();
