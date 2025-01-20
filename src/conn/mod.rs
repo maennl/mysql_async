@@ -103,6 +103,7 @@ struct ConnInner {
     status: StatusFlags,
     last_ok_packet: Option<OkPacket<'static>>,
     last_err_packet: Option<mysql_common::packets::ServerError<'static>>,
+    handshake_complete: bool,
     pool: Option<Pool>,
     pending_result: std::result::Result<Option<PendingResult>, ServerError>,
     tx_status: TxStatus,
@@ -116,6 +117,7 @@ struct ConnInner {
     auth_plugin: AuthPlugin<'static>,
     auth_switched: bool,
     server_key: Option<Vec<u8>>,
+    active_since: Instant,
     /// Connection is already disconnected.
     pub(crate) disconnected: bool,
     /// One-time connection-level infile handler.
@@ -148,6 +150,7 @@ impl ConnInner {
             status: StatusFlags::empty(),
             last_ok_packet: None,
             last_err_packet: None,
+            handshake_complete: false,
             stream: None,
             is_mariadb: false,
             version: (0, 0, 0),
@@ -168,6 +171,7 @@ impl ConnInner {
             server_key: None,
             infile_handler: None,
             reset_upon_returning_to_a_pool: false,
+            active_since: Instant::now(),
         }
     }
 
@@ -501,10 +505,7 @@ impl Conn {
         self.inner.capabilities = handshake.capabilities() & self.inner.opts.get_capabilities();
         self.inner.version = handshake
             .maria_db_server_version_parsed()
-            .map(|version| {
-                self.inner.is_mariadb = true;
-                version
-            })
+            .inspect(|_| self.inner.is_mariadb = true)
             .or_else(|| handshake.server_version_parsed())
             .unwrap_or((0, 0, 0));
         self.inner.id = handshake.connection_id();
@@ -550,7 +551,10 @@ impl Conn {
             self.write_struct(&ssl_request).await?;
             let conn = self;
             let ssl_opts = conn.opts().ssl_opts().cloned().expect("unreachable");
-            let domain = conn.opts().ip_or_hostname().into();
+            let domain = ssl_opts
+                .tls_hostname_override()
+                .unwrap_or_else(|| conn.opts().ip_or_hostname())
+                .into();
             conn.stream_mut()?.make_secure(domain, ssl_opts).await?;
             Ok(())
         } else {
@@ -564,13 +568,26 @@ impl Conn {
             .auth_plugin
             .gen_data(self.inner.opts.pass(), &self.inner.nonce);
 
-        let handshake_response = HandshakeResponse::new(auth_data.as_deref(), self.inner.version, self.inner.opts.user().map(|x| x.as_bytes()), self.inner.opts.db_name().map(|x| x.as_bytes()), Some(self.inner.auth_plugin.borrow()), self.capabilities(), Default::default(),1024*1024*1024);
+        let handshake_response = HandshakeResponse::new(
+            auth_data.as_deref(),
+            self.inner.version,
+            self.inner.opts.user().map(|x| x.as_bytes()),
+            self.inner.opts.db_name().map(|x| x.as_bytes()),
+            Some(self.inner.auth_plugin.borrow()),
+            self.capabilities(),
+            Default::default(), // TODO: Add support
+            self.inner
+                .opts
+                .max_allowed_packet()
+                .unwrap_or(DEFAULT_MAX_ALLOWED_PACKET) as u32,
+        );
 
         // Serialize here to satisfy borrow checker.
-        let mut buf = crate::BUFFER_POOL.get();
+        let mut buf = crate::buffer_pool().get();
         handshake_response.serialize(buf.as_mut());
 
         self.write_packet(buf).await?;
+        self.inner.handshake_complete = true;
         Ok(())
     }
 
@@ -619,7 +636,7 @@ impl Conn {
             if let Some(plugin_data) = plugin_data {
                 self.write_struct(&plugin_data.into_owned()).await?;
             } else {
-                self.write_packet(crate::BUFFER_POOL.get()).await?;
+                self.write_packet(crate::buffer_pool().get()).await?;
             }
 
             self.continue_auth().await?;
@@ -687,7 +704,7 @@ impl Conn {
                 }
                 Some(0x04) => {
                     let pass = self.inner.opts.pass().unwrap_or_default();
-                    let mut pass = crate::BUFFER_POOL.get_with(pass.as_bytes());
+                    let mut pass = crate::buffer_pool().get_with(pass.as_bytes());
                     pass.as_mut().push(0);
 
                     if self.is_secure() || self.is_socket() {
@@ -775,7 +792,19 @@ impl Conn {
         if let Ok(ok_packet) = ok_packet {
             self.handle_ok(ok_packet.into_owned());
         } else {
-            let err_packet = ParseBuf(packet).parse::<ErrPacket>(self.capabilities());
+            // If we haven't completed the handshake the server will not be aware of our
+            // capabilities and so it will behave as if we have none. In particular, the error
+            // packet will not contain a SQL State field even if our capabilities do contain the
+            // `CLIENT_PROTOCOL_41` flag. Therefore it is necessary to parse an incoming packet
+            // with no capability assumptions if we have not completed the handshake.
+            //
+            // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase.html
+            let capabilities = if self.inner.handshake_complete {
+                self.capabilities()
+            } else {
+                CapabilityFlags::empty()
+            };
+            let err_packet = ParseBuf(packet).parse::<ErrPacket>(capabilities);
             if let Ok(err_packet) = err_packet {
                 self.handle_err(err_packet)?;
                 return Ok(true);
@@ -824,13 +853,13 @@ impl Conn {
 
     /// Writes bytes to a server.
     pub(crate) async fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        let buf = crate::BUFFER_POOL.get_with(bytes);
+        let buf = crate::buffer_pool().get_with(bytes);
         self.write_packet(buf).await
     }
 
     /// Sends a serializable structure to a server.
     pub(crate) async fn write_struct<T: MySerialize>(&mut self, x: &T) -> Result<()> {
-        let mut buf = crate::BUFFER_POOL.get();
+        let mut buf = crate::buffer_pool().get();
         x.serialize(buf.as_mut());
         self.write_packet(buf).await
     }
@@ -856,7 +885,7 @@ impl Conn {
         T: AsRef<[u8]>,
     {
         let cmd_data = cmd_data.as_ref();
-        let mut buf = crate::BUFFER_POOL.get();
+        let mut buf = crate::buffer_pool().get();
         let body = buf.as_mut();
         body.push(cmd as u8);
         body.extend_from_slice(cmd_data);
@@ -899,7 +928,7 @@ impl Conn {
                 {
                     Stream::connect_socket(_path.to_owned()).await?
                 }
-                #[cfg(target_os = "windows")]
+                #[cfg(not(unix))]
                 return Err(crate::DriverError::NamedPipesDisabled.into());
             } else {
                 let keepalive = opts
@@ -951,7 +980,7 @@ impl Conn {
     /// Configures the connection based on server settings. In particular:
     ///
     /// * It reads and stores socket address inside the connection unless if socket address is
-    /// already in [`Opts`] or if `prefer_socket` is `false`.
+    ///   already in [`Opts`] or if `prefer_socket` is `false`.
     ///
     /// * It reads and stores `max_allowed_packet` in the connection unless it's already in [`Opts`]
     ///
@@ -1256,10 +1285,11 @@ mod test {
     use futures_util::stream::{self, StreamExt};
     use mysql_common::constants::MAX_PAYLOAD_LEN;
     use rand::Fill;
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
 
     use crate::{
         from_row, params, prelude::*, test_misc::get_opts, ChangeUserOpts, Conn, Error,
-        OptsBuilder, Pool, Value, WhiteListFsHandler,
+        OptsBuilder, Pool, ServerError, Value, WhiteListFsHandler,
     };
 
     #[tokio::test]
@@ -1386,16 +1416,18 @@ mod test {
         .filter(|variant| plugins.iter().any(|p| p == variant.0));
 
         for (plug, val, pass) in variants {
+            dbg!((plug, val, pass, conn.inner.version));
+
+            if plug == "mysql_native_password" && conn.inner.version >= (8, 4, 0) {
+                continue;
+            }
+
             let _ = conn.query_drop("DROP USER 'test_user'@'%'").await;
 
             let query = format!("CREATE USER 'test_user'@'%' IDENTIFIED WITH {}", plug);
             conn.query_drop(query).await.unwrap();
 
-            if (8, 0, 11) <= conn.inner.version && conn.inner.version <= (9, 0, 0) {
-                conn.query_drop(format!("SET PASSWORD FOR 'test_user'@'%' = '{}'", pass))
-                    .await
-                    .unwrap();
-            } else {
+            if conn.inner.version < (8, 0, 11) {
                 conn.query_drop(format!("SET old_passwords = {}", val))
                     .await
                     .unwrap();
@@ -1405,6 +1437,10 @@ mod test {
                 ))
                 .await
                 .unwrap();
+            } else {
+                conn.query_drop(format!("SET PASSWORD FOR 'test_user'@'%' = '{}'", pass))
+                    .await
+                    .unwrap();
             };
 
             let opts = get_opts()
@@ -1533,7 +1569,11 @@ mod test {
             &["mysql_native_password"]
         };
 
-        for plugin in plugins {
+        for (i, plugin) in plugins.iter().enumerate() {
+            if *plugin == "mysql_native_password" && conn.server_version() >= (8, 4, 0) {
+                continue;
+            }
+
             let mut rng = rand::thread_rng();
             let mut pass = [0u8; 10];
             pass.try_fill(&mut rng).unwrap();
@@ -1541,10 +1581,15 @@ mod test {
                 .map(|x| ((x % (123 - 97)) + 97) as char)
                 .collect();
 
-            conn.query_drop("DELETE FROM mysql.user WHERE user = '__mats'")
-                .await
-                .unwrap();
-            conn.query_drop("FLUSH PRIVILEGES").await.unwrap();
+            let result = conn
+                .query_drop("DROP USER /*!50700 IF EXISTS */ /*M!100103 IF EXISTS */ __mats")
+                .await;
+            if matches!(conn.server_version(), (5, 6, _)) && i == 0 {
+                // IF EXISTS is not supported on 5.6 so the query will fail on the first iteration
+                drop(result);
+            } else {
+                result.unwrap();
+            }
 
             if conn.inner.is_mariadb || conn.server_version() < (5, 7, 0) {
                 if matches!(conn.server_version(), (5, 6, _)) {
@@ -1575,8 +1620,6 @@ mod test {
                 .await
                 .unwrap();
             };
-
-            conn.query_drop("FLUSH PRIVILEGES").await.unwrap();
 
             let mut conn2 = Conn::new(get_opts().secure_auth(false)).await.unwrap();
             conn2
@@ -2170,6 +2213,45 @@ mod test {
         assert_eq!(result[2], "CCCCCC");
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn should_handle_initial_error_packet() {
+        let header = [
+            0x68, 0x00, 0x00, // packet_length
+            0x00, // sequence
+            0xff, // error_header
+            0x69, 0x04, // error_code
+        ];
+        let error_message = "Host '172.17.0.1' is blocked because of many connection errors; unblock with 'mysqladmin flush-hosts'";
+
+        // Create a fake MySQL server that immediately replies with an error packet.
+        let listener = TcpListener::bind("127.0.0.1:0000").await.unwrap();
+
+        let listen_addr = listener.local_addr().unwrap();
+
+        tokio::task::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(&header).await.unwrap();
+            stream.write_all(error_message.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let opts = OptsBuilder::default()
+            .ip_or_hostname(listen_addr.ip().to_string())
+            .tcp_port(listen_addr.port());
+        let server_err = match Conn::new(opts).await {
+            Err(Error::Server(server_err)) => server_err,
+            other => panic!("expected server error but got: {:?}", other),
+        };
+        assert_eq!(
+            server_err,
+            ServerError {
+                code: 1129,
+                state: "HY000".to_owned(),
+                message: error_message.to_owned(),
+            }
+        );
     }
 
     #[cfg(feature = "nightly")]
