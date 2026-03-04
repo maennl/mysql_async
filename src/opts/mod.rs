@@ -16,7 +16,7 @@ pub use native_tls_opts::ClientIdentity;
 pub use rustls_opts::ClientIdentity;
 
 use percent_encoding::percent_decode;
-use rand::Rng;
+use rand::{RngExt};
 use tokio::sync::OnceCell;
 use url::{Host, Url};
 

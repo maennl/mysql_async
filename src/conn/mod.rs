@@ -1320,7 +1320,7 @@ mod test {
     use bytes::Bytes;
     use futures_util::stream::{self, StreamExt};
     use mysql_common::constants::MAX_PAYLOAD_LEN;
-    use rand::Rng;
+    use rand::RngExt;
     use tokio::{io::AsyncWriteExt, net::TcpListener};
 
     use crate::{

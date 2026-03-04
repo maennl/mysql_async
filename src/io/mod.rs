@@ -498,7 +498,7 @@ mod test {
         };
 
         assert_eq!(
-            sock.keepalive_time().unwrap(),
+            sock.tcp_keepalive_time().unwrap(),
             std::time::Duration::from_millis(42_000),
         );
 
