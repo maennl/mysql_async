@@ -52,7 +52,7 @@ impl<L: TracingLevel> Routine<()> for QueryRoutine<'_, L> {
         let fut = async move {
             conn.write_command_data(Command::COM_QUERY, self.data)
                 .await?;
-            conn.read_result_set::<TextProtocol>(true).await?;
+            conn.read_result_set::<TextProtocol>(true, None).await?;
             Ok(())
         };
 

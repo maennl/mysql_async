@@ -2616,6 +2616,146 @@ mod test {
         }
     }
 
+    // This test verifies that the metadata is correct with or without metadata caching, and that protocol
+    // is not broken afterwards and data is read correctly. It doesn't test that the metadata is really cached
+    // (if that is possible) and not received twice.
+    #[tokio::test]
+    async fn test_metadata_caching() {
+        use crate::consts::ColumnType;
+        let mut conn = Conn::new(get_opts()).await.unwrap();
+        if !conn.inner.is_mariadb {
+            return;
+        }
+
+        conn.query_drop(
+            r"CREATE TEMPORARY TABLE t_metadata_caching (
+                id INT NOT NULL PRIMARY KEY AUTO_INCREMENT,
+                val VARCHAR(32) NOT NULL)",
+        )
+        .await
+        .unwrap();
+
+        // Populating table with some data to verify that data still fetched correctly with cached metadata use
+        let insert_stmt = conn
+            .prep("INSERT INTO t_metadata_caching (val) VALUES (?)")
+            .await
+            .unwrap();
+        let _ = conn.exec_drop(&insert_stmt, ("AAA",)).await;
+        let _ = conn.exec_drop(&insert_stmt, ("BB",)).await;
+        let mut ps = conn
+            .prep("SELECT id, val FROM t_metadata_caching")
+            .await
+            .unwrap();
+
+        let mut columns_from_prep = ps.columns();
+        let mut metadata_from_prep: Vec<(String, ColumnType)> = columns_from_prep
+            .iter()
+            .map(|column| (column.name_str().to_string(), column.column_type()))
+            .collect();
+
+        let mut query_result = conn.exec_iter(&ps, ()).await.unwrap();
+        let mut columns_from_exec1 = query_result.columns().unwrap();
+        let mut metadata_from_exec1: Vec<(String, ColumnType)> = columns_from_exec1
+            .iter()
+            .map(|column| (column.name_str().to_string(), column.column_type()))
+            .collect();
+
+        // Comparing and verifying metadata.
+        assert_eq!(metadata_from_prep, metadata_from_exec1);
+        assert_eq!(metadata_from_prep.len(), 2);
+        assert_eq!(metadata_from_prep[0].0, "id");
+        assert_eq!(metadata_from_prep[0].1, ColumnType::MYSQL_TYPE_LONG);
+        assert_eq!(metadata_from_prep[1].0, "val");
+        assert_eq!(metadata_from_prep[1].1, ColumnType::MYSQL_TYPE_VAR_STRING);
+
+        let fetched_rows: Vec<(i32, String)> = query_result.collect().await.unwrap();
+
+        let expected_rows = [(1, "AAA".to_string()), (2, "BB".to_string())];
+        assert_eq!(fetched_rows.len(), expected_rows.len());
+
+        for (fetched, expected) in fetched_rows.iter().zip(expected_rows.iter()) {
+            assert_eq!(fetched, expected);
+        }
+
+        // Doing the same for exec_first. Technically it's internally the same as exec_iter,
+        // but the test isn't supposed to know that and to test it
+        ps = conn
+            .prep("SELECT val FROM t_metadata_caching WHERE id = ?")
+            .await
+            .unwrap();
+        columns_from_prep = ps.columns();
+        metadata_from_prep = columns_from_prep
+            .iter()
+            .map(|column| (column.name_str().to_string(), column.column_type()))
+            .collect();
+        let single_row: Option<String> = conn.exec_first(&ps, (1,)).await.unwrap();
+        if let Some(val) = single_row {
+            assert_eq!(metadata_from_prep.len(), 1);
+            assert_eq!(metadata_from_prep[0].0, "val");
+            assert_eq!(metadata_from_prep[0].1, ColumnType::MYSQL_TYPE_VAR_STRING);
+
+            assert_eq!(val, "AAA".to_string());
+        }
+        // Testing the case when metadata is changed after execution
+        ps = conn.prep("SELECT ?").await.unwrap();
+
+        columns_from_prep = ps.columns();
+        metadata_from_prep = columns_from_prep
+            .iter()
+            .map(|column| (column.name_str().to_string(), column.column_type()))
+            .collect();
+
+        // First query — server sends metadata because the type has changed
+        query_result = conn.exec_iter(&ps, (12,)).await.unwrap();
+        columns_from_exec1 = query_result.columns().unwrap();
+        metadata_from_exec1 = columns_from_exec1
+            .iter()
+            .map(|column| (column.name_str().to_string(), column.column_type()))
+            .collect();
+        let fetched_rows: Vec<i32> = query_result.collect().await.unwrap();
+
+        // Second query — server skips metadata packets
+        query_result = conn.exec_iter(&ps, (42,)).await.unwrap();
+        let columns_from_exec2 = query_result.columns().unwrap();
+        let metadata_from_exec2 = columns_from_exec2
+            .iter()
+            .map(|column| (column.name_str().to_string(), column.column_type()))
+            .collect::<Vec<_>>();
+        let fetched_rows2: Vec<i32> = query_result.collect().await.unwrap();
+
+        // Third query — server sends metadata because the type has changed
+        query_result = conn.exec_iter(&ps, ("foo",)).await.unwrap();
+        let columns_from_exec3 = query_result.columns().unwrap();
+        let metadata_from_exec3 = columns_from_exec3
+            .iter()
+            .map(|column| (column.name_str().to_string(), column.column_type()))
+            .collect::<Vec<_>>();
+        let fetched_rows3: Vec<String> = query_result.collect().await.unwrap();
+
+        // Comparing and verifying metadata.
+        assert_eq!(metadata_from_exec1.len(), 1);
+        assert_eq!(metadata_from_exec2.len(), 1);
+        assert_eq!(metadata_from_exec3.len(), 1);
+        assert_eq!(metadata_from_prep.len(), 1);
+        assert_eq!(metadata_from_prep[0].0, "?");
+        assert!(
+            metadata_from_prep[0].1 == ColumnType::MYSQL_TYPE_NULL
+                || metadata_from_prep[0].1 == ColumnType::MYSQL_TYPE_VAR_STRING,
+            "Expected MYSQL_TYPE_NULL(MariaDB) or MYSQL_TYPE_VAR_STRING(MySQL), got {:?}",
+            metadata_from_prep[0].1
+        );
+        assert_eq!(metadata_from_exec1[0].0, "?");
+        assert_eq!(metadata_from_exec1[0].1, ColumnType::MYSQL_TYPE_LONGLONG);
+        assert_eq!(metadata_from_exec2[0].0, "?");
+        assert_eq!(metadata_from_exec2[0].1, ColumnType::MYSQL_TYPE_LONGLONG);
+        assert_eq!(metadata_from_exec3[0].0, "?");
+        assert_eq!(metadata_from_exec3[0].1, ColumnType::MYSQL_TYPE_VAR_STRING);
+
+        assert_eq!(fetched_rows[0], 12);
+        assert_eq!(fetched_rows2[0], 42);
+        assert_eq!(fetched_rows3[0], "foo".to_owned());
+    }
+
     #[cfg(feature = "nightly")]
     mod bench {
         use crate::{conn::Conn, queryable::Queryable, test_misc::get_opts};

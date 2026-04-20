@@ -1129,6 +1129,7 @@ impl Opts {
 
     pub(crate) fn get_mariadb_capabilities(&self) -> MariadbCapabilities {
         MariadbCapabilities::MARIADB_CLIENT_STMT_BULK_OPERATIONS
+            | MariadbCapabilities::MARIADB_CLIENT_CACHE_METADATA
             | MariadbCapabilities::MARIADB_CLIENT_BULK_UNIT_RESULTS
     }
 

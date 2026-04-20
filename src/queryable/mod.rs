@@ -49,6 +49,7 @@ pub trait Protocol: fmt::Debug + Send + Sync + 'static {
             packet[0] == 0xFE && packet.len() < 8
         }
     }
+    fn metadata_skip_possible(conn: &Conn) -> bool;
 }
 
 /// Phantom struct used to specify MySql text protocol.
@@ -70,6 +71,10 @@ impl Protocol for TextProtocol {
             .map(Into::into)
             .map_err(Into::into)
     }
+
+    fn metadata_skip_possible(_conn: &Conn) -> bool {
+        false
+    }
 }
 
 impl Protocol for BinaryProtocol {
@@ -82,6 +87,10 @@ impl Protocol for BinaryProtocol {
             .parse::<RowDeserializer<ServerSide, Binary>>(columns)
             .map(Into::into)
             .map_err(Into::into)
+    }
+
+    fn metadata_skip_possible(conn: &Conn) -> bool {
+        conn.has_mariadb_capabilities(MariadbCapabilities::MARIADB_CLIENT_CACHE_METADATA)
     }
 }
 

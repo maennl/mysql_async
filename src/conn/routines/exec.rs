@@ -82,7 +82,8 @@ impl Routine<()> for ExecRoutine<'_> {
             }
 
             conn.write_command(&body).await?;
-            conn.read_result_set::<BinaryProtocol>(true).await?;
+            conn.read_result_set::<BinaryProtocol>(true, Some(self.stmt))
+                .await?;
 
             Ok(())
         };
@@ -142,7 +143,8 @@ where
             for command in builder.build_params_iter(params) {
                 let command = command.map_err(crate::DriverError::from)?;
                 conn.write_command(&command).await?;
-                conn.read_result_set::<BinaryProtocol>(true).await?;
+                conn.read_result_set::<BinaryProtocol>(true, Some(stmt))
+                    .await?;
                 let query_result = QueryResult::<'_, '_, BinaryProtocol>::new(&mut *conn);
                 query_result.drop_result().await?;
             }
