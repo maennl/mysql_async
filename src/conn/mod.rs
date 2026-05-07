@@ -998,7 +998,7 @@ impl Conn {
 
     async fn run_init_commands(&mut self) -> Result<()> {
         if let Some(callback) = self.inner.opts.after_connect() {
-            callback.clone()(self).await?;
+            callback(self).await?;
         }
 
         let mut init = self.inner.opts.init().to_vec();
@@ -1386,8 +1386,6 @@ impl Conn {
 
 #[cfg(test)]
 mod test {
-    use std::sync::Arc;
-
     use bytes::Bytes;
     use futures_util::{
         stream::{self, StreamExt},
@@ -1598,14 +1596,14 @@ mod test {
 
     #[tokio::test]
     async fn should_execute_after_connect_callback_on_new_connection() -> super::Result<()> {
-        let opts = OptsBuilder::from_opts(get_opts()).after_connect(Arc::new(|conn| {
+        let opts = OptsBuilder::from_opts(get_opts()).after_connect(|conn| {
             async move {
                 conn.query_drop("SET @a = 42").await?;
                 conn.query_drop("SET @b = 'foo'").await?;
                 Ok(())
             }
             .boxed()
-        }));
+        });
         let mut conn = Conn::new(opts).await?;
         let result: Vec<(u8, String)> = conn.query("SELECT @a, @b").await?;
         conn.disconnect().await?;
@@ -1615,9 +1613,8 @@ mod test {
 
     #[tokio::test]
     async fn should_propagate_after_connect_callback_error() -> super::Result<()> {
-        let opts = OptsBuilder::from_opts(get_opts()).after_connect(Arc::new(|_conn| {
-            async move { Err(Error::Other("rejected".into())) }.boxed()
-        }));
+        let opts = OptsBuilder::from_opts(get_opts())
+            .after_connect(|_conn| async move { Err(Error::Other("rejected".into())) }.boxed());
         let e = Conn::new(opts).await.unwrap_err();
         match e {
             Error::Other(e) => assert_eq!(e.to_string(), "rejected"),

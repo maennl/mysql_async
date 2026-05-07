@@ -562,22 +562,24 @@ pub(crate) struct InnerOpts {
     address: HostPortOrUrl,
 }
 
+/// This type alias is added to make clippy happy.
+type AfterConnectCallback =
+    Arc<dyn for<'a> Fn(&'a mut crate::Conn) -> crate::BoxFuture<'a, ()> + Send + Sync + 'static>;
+
 #[derive(Clone)]
-pub(crate) struct AfterConnectCallback(
-    Arc<dyn for<'a> Fn(&'a mut crate::Conn) -> crate::BoxFuture<'a, ()> + Send + Sync>,
-);
+pub(crate) struct AfterConnectCallbackWrapper(AfterConnectCallback);
 
-impl Eq for AfterConnectCallback {}
+impl Eq for AfterConnectCallbackWrapper {}
 
-impl PartialEq for AfterConnectCallback {
+impl PartialEq for AfterConnectCallbackWrapper {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
-impl fmt::Debug for AfterConnectCallback {
+impl fmt::Debug for AfterConnectCallbackWrapper {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("AfterConnectCallback").finish()
+        f.debug_tuple("AfterConnectCallbackWrapper").finish()
     }
 }
 
@@ -615,7 +617,7 @@ pub(crate) struct MysqlOpts {
     conn_ttl: Option<Duration>,
 
     /// Callback to execute once a new connection is established.
-    after_connect: Option<AfterConnectCallback>,
+    after_connect: Option<AfterConnectCallbackWrapper>,
 
     /// Commands to execute once new connection is established.
     init: Vec<String>,
@@ -810,11 +812,26 @@ impl Opts {
     /// before the [`init`][Self::init] queries.
     ///
     /// If this returns an error, the connection attempt will also fail.
-    pub fn after_connect(
-        &self,
-    ) -> Option<&Arc<dyn for<'a> Fn(&'a mut crate::Conn) -> crate::BoxFuture<'a, ()> + Send + Sync>>
-    {
-        self.inner.mysql_opts.after_connect.as_ref().map(|cb| &cb.0)
+    ///
+    /// ```no_run
+    /// use futures_util::FutureExt;
+    /// use mysql_async::OptsBuilder;
+    ///
+    /// let opts_builder: OptsBuilder = todo!();
+    ///
+    /// opts_builder.after_connect(|conn| {
+    ///     async move {
+    ///         // do something with `conn`
+    ///         Ok(())
+    ///     }.boxed()
+    /// });
+    /// ```
+    pub fn after_connect(&self) -> Option<AfterConnectCallback> {
+        self.inner
+            .mysql_opts
+            .after_connect
+            .as_ref()
+            .map(|cb| cb.0.clone())
     }
 
     /// Commands to execute once new a connection is established.
@@ -1393,13 +1410,11 @@ impl OptsBuilder {
     }
 
     /// Defines a callback that runs after connection. See [`Opts::after_connect`].
-    pub fn after_connect(
-        mut self,
-        callback: Arc<
-            dyn for<'a> Fn(&'a mut crate::Conn) -> crate::BoxFuture<'a, ()> + Send + Sync,
-        >,
-    ) -> Self {
-        self.opts.after_connect = Some(AfterConnectCallback(callback));
+    pub fn after_connect<F>(mut self, callback: F) -> Self
+    where
+        F: for<'a> Fn(&'a mut crate::Conn) -> crate::BoxFuture<'a, ()> + Send + Sync + 'static,
+    {
+        self.opts.after_connect = Some(AfterConnectCallbackWrapper(Arc::new(callback)));
         self
     }
 
