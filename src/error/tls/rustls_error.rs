@@ -8,7 +8,7 @@ use rustls::server::VerifierBuilderError;
 pub enum TlsError {
     Tls(rustls::Error),
     InvalidDnsName(rustls::pki_types::InvalidDnsNameError),
-    InvalidPem(rustls::pki_types::pem::Error),
+    Pem(rustls::pki_types::pem::Error),
     VerifierBuilderError(VerifierBuilderError),
 }
 
@@ -38,7 +38,7 @@ impl From<rustls::pki_types::InvalidDnsNameError> for TlsError {
 
 impl From<rustls::pki_types::pem::Error> for TlsError {
     fn from(e: rustls::pki_types::pem::Error) -> Self {
-        TlsError::InvalidPem(e)
+        TlsError::Pem(e)
     }
 }
 
@@ -59,7 +59,7 @@ impl std::error::Error for TlsError {
         match self {
             TlsError::Tls(e) => Some(e),
             TlsError::InvalidDnsName(e) => Some(e),
-            TlsError::InvalidPem(e) => Some(e),
+            TlsError::Pem(e) => Some(e),
             TlsError::VerifierBuilderError(e) => Some(e),
         }
     }
@@ -70,7 +70,7 @@ impl Display for TlsError {
         match self {
             TlsError::Tls(e) => e.fmt(f),
             TlsError::InvalidDnsName(e) => e.fmt(f),
-            TlsError::InvalidPem(e) => e.fmt(f),
+            TlsError::Pem(e) => e.fmt(f),
             TlsError::VerifierBuilderError(e) => e.fmt(f),
         }
     }
