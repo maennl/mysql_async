@@ -380,7 +380,7 @@ impl PoolOpts {
     ///
     /// * reset procedure removes all prepared statements, i.e. kills prepared statements cache
     /// * connection reset is quite fast but requires additional client-server roundtrip
-    ///   (might also requires requthentication for older servers)
+    ///   (might also requires reauthentication for older servers)
     ///
     /// The purpose of the reset procedure is to:
     ///
@@ -391,7 +391,7 @@ impl PoolOpts {
     /// * remove temporary tables
     /// * remove all PREPARE statement (this action kills prepared statements cache)
     ///
-    /// So to encrease overall performance you can safely opt-out of the default behavior
+    /// So to increase overall performance you can safely opt-out of the default behavior
     /// if you are not willing to change the session state in an unpleasant way.
     ///
     /// It is also possible to selectively opt-in/out using [`Conn::reset_connection`][1].
@@ -421,7 +421,7 @@ impl PoolOpts {
     }
 
     /// Sets an absolute TTL after which a connection is removed from the pool.
-    /// This may push the pool below the requested minimum pool size and is indepedent of the
+    /// This may push the pool below the requested minimum pool size and is independent of the
     /// idle TTL.
     /// The absolute TTL is disabled by default.
     /// Fractions of seconds are ignored.
@@ -725,7 +725,7 @@ impl Opts {
                 .map_err(|_| UrlError::Invalid)?;
         }
 
-        let mysql_opts = mysqlopts_from_url(&url)?;
+        let mysql_opts = mysql_opts_from_url(&url)?;
         let address = HostPortOrUrl::Url(url);
 
         let inner_opts = InnerOpts {
@@ -738,7 +738,7 @@ impl Opts {
         })
     }
 
-    /// Address of mysql server (defaults to `127.0.0.1`). Hostnames should also work.
+    /// Address of mysql server (defaults to `127.0.0.1`). Host names should also work.
     pub fn ip_or_hostname(&self) -> &str {
         self.inner.address.get_ip_or_hostname()
     }
@@ -990,21 +990,21 @@ impl Opts {
     ///
     /// # Connection URL parameters
     ///
-    /// Note that for securty reasons:
+    /// Note that for security reasons:
     ///
     /// * CA and IDENTITY verifications are opt-out
-    /// * there is no way to give an idenity or root certs via query URL
+    /// * there is no way to give an identity or root certs via query URL
     ///
     /// URL Parameters:
     ///
     /// *   `require_ssl: bool` (defaults to `false`) – requires SSL with default [`SslOpts`]
     /// *   `verify_ca: bool` (defaults to `true`) – requires server Certificate Authority (CA)
     ///     certificate validation against the configured CA certificates.
-    ///     Makes no sence if  `require_ssl` equals `false`.
+    ///     Makes no sense if  `require_ssl` equals `false`.
     /// *   `verify_identity: bool` (defaults to `true`) – perform host name identity verification
     ///     by checking the host name the client uses for connecting to the server against
     ///     the identity in the certificate that the server sends to the client.
-    ///     Makes no sence if  `require_ssl` equals `false`.
+    ///     Makes no sense if  `require_ssl` equals `false`.
     ///
     ///
     pub fn ssl_opts(&self) -> Option<&SslOpts> {
@@ -1769,7 +1769,7 @@ fn from_url_basic(url: &Url) -> std::result::Result<(MysqlOpts, Vec<(String, Str
     Ok((opts, query_pairs))
 }
 
-fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
+fn mysql_opts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
     let (mut opts, query_pairs): (MysqlOpts, _) = from_url_basic(url)?;
     let mut pool_min = DEFAULT_POOL_CONSTRAINTS.min;
     let mut pool_max = DEFAULT_POOL_CONSTRAINTS.max;

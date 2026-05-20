@@ -59,7 +59,7 @@ pub mod stmt_cache;
 
 const DEFAULT_WAIT_TIMEOUT: usize = 28800;
 
-/// Helper that asynchronously disconnects the givent connection on the default tokio executor.
+/// Helper that asynchronously disconnects the given connection on the default tokio executor.
 fn disconnect(mut conn: Conn) {
     let disconnected = conn.inner.disconnected;
 
@@ -295,7 +295,7 @@ impl Conn {
         }
     }
 
-    /// Will syncronize sequence ids between compressed and uncompressed codecs.
+    /// Will synchronize sequence ids between compressed and uncompressed codecs.
     pub(crate) fn sync_seq_id(&mut self) {
         if let Some(stream) = self.inner.stream.as_mut() {
             stream.sync_seq_id();
@@ -357,7 +357,7 @@ impl Conn {
         self.inner.pending_result.is_err() || matches!(self.inner.pending_result, Ok(Some(_)))
     }
 
-    /// Sets the given pening result metadata for this connection. Returns the previous value.
+    /// Sets the given pending result metadata for this connection. Returns the previous value.
     pub(crate) fn set_pending_result(
         &mut self,
         meta: Option<ResultSetMeta>,
@@ -755,22 +755,22 @@ impl Conn {
 
     async fn continue_parsec_auth(&mut self) -> Result<()> {
         let packet = self.read_packet().await?;
-        // Noramally we need to skip escaping 0x01 byte. But in first parsec implementations, server did not send it.
+        // Normally we need to skip escaping 0x01 byte. But in first parsec implementations, server did not send it.
         let mut payload: &[u8] = &packet;
         if packet.first() == Some(&0x01) {
             payload = &packet[1..];
         }
         // At this point in future, when it will be possible for parsec to be default authentication method,
-        // we can have authentication switch request. The other possibele option here(and for now the only option) -
+        // we can have authentication switch request. The other possible option here(and for now the only option) -
         // ext-salt packet.
-        if payload.len() > 0 && payload[0] == 0xfe {
-            let auth_switch_request = ParseBuf(&payload).parse(())?;
+        if payload.first() == Some(&0xfe) {
+            let auth_switch_request = ParseBuf(payload).parse(())?;
             self.perform_auth_switch(auth_switch_request).await
         } else {
             // Letting parser function decide if all is fine with the packet
             self.inner
                 .auth_plugin
-                .read_add_data(&payload)
+                .read_add_data(payload)
                 .ok_or_else(|| DriverError::InvalidParsecSalt)?;
             // Now generating response.
             let plugin_data = self
@@ -1322,7 +1322,7 @@ impl Conn {
     }
 
     /// The purpose of this function is to cleanup a pending result set
-    /// for prematurely dropeed connection or query result.
+    /// for prematurely dropped connection or query result.
     ///
     /// Requires that there are no other references to the pending result.
     pub(crate) async fn drop_result(&mut self) -> Result<()> {
@@ -1332,7 +1332,7 @@ impl Conn {
             Some(PendingResult::Taken(meta)) => {
                 // This also asserts that there is only one reference left to the taken ResultSetMeta,
                 // therefore this result set must be dropped here since it won't be dropped anywhere else.
-                Some(Arc::try_unwrap(meta).expect("Conn::drop_result call on a pending result that may still be droped by someone else"))
+                Some(Arc::try_unwrap(meta).expect("Conn::drop_result call on a pending result that may still be dropped by someone else"))
             }
             None => None,
         };
@@ -1475,7 +1475,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn should_clean_state_if_wrapper_is_dropeed() -> super::Result<()> {
+    async fn should_clean_state_if_wrapper_is_dropped() -> super::Result<()> {
         let mut conn: Conn = Conn::new(get_opts()).await?;
 
         conn.query_drop("CREATE TEMPORARY TABLE mysql.foo (id SERIAL)")

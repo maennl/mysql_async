@@ -13,7 +13,7 @@ use mysql_common::{
 use crate::{error::LocalInfileError, queryable::Protocol, Conn, Error, Statement};
 
 impl Conn {
-    /// Helper, that sends all `Value::Bytes` in the given list of paramenters as long data.
+    /// Helper, that sends all `Value::Bytes` in the given list of parameters as long data.
     pub(super) async fn send_long_data<'a, I>(
         &mut self,
         statement_id: u32,
@@ -143,7 +143,7 @@ impl Conn {
             P::result_set_meta(Arc::from(columns.into_boxed_slice()))
         } else {
             // Since metadata is skipped, stmt must be present.
-            P::result_set_meta(Arc::from(stmt.unwrap().columns()))
+            P::result_set_meta(stmt.unwrap().columns())
         };
         self.set_pending_result(Some(meta))?;
         Ok(())
