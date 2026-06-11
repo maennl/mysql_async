@@ -221,6 +221,8 @@ pub struct SslOpts {
     skip_domain_validation: bool,
     accept_invalid_certs: bool,
     tls_hostname_override: Option<Cow<'static, str>>,
+    #[cfg(feature = "rustls-tls")]
+    disable_tls_resumption: bool,
 }
 
 impl SslOpts {
@@ -312,6 +314,26 @@ impl SslOpts {
         self
     }
 
+    /// If `true`, disables TLS session resumption.
+    /// By default TLS session resumption is enabled.
+    ///
+    /// # Connection URL
+    ///
+    /// Use `disable_tls_resumption` URL parameter to set this value:
+    ///
+    /// ```
+    /// # use mysql_async::*;
+    /// # fn main() -> Result<()> {
+    /// let opts = Opts::from_url("mysql://localhost/db?require_ssl=true&disable_tls_resumption=true")?;
+    /// assert_eq!(opts.ssl_opts().unwrap().disable_tls_resumption(), true);
+    /// # Ok(()) }
+    /// ```
+    #[cfg(feature = "rustls-tls")]
+    pub fn with_disable_tls_resumption(mut self, disable_tls_resumption: bool) -> Self {
+        self.disable_tls_resumption = disable_tls_resumption;
+        self
+    }
+
     #[cfg(any(feature = "native-tls-tls", feature = "rustls-tls"))]
     pub fn client_identity(&self) -> Option<&ClientIdentity> {
         self.client_identity.as_ref()
@@ -335,6 +357,12 @@ impl SslOpts {
 
     pub fn tls_hostname_override(&self) -> Option<&str> {
         self.tls_hostname_override.as_deref()
+    }
+
+    /// Returns `true` if TLS session resumption is disabled.
+    #[cfg(feature = "rustls-tls")]
+    pub fn disable_tls_resumption(&self) -> bool {
+        self.disable_tls_resumption
     }
 }
 
@@ -1778,6 +1806,8 @@ fn mysql_opts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
     let mut skip_domain_validation = false;
     let mut accept_invalid_certs = false;
     let mut disable_built_in_roots = false;
+    #[cfg(feature = "rustls-tls")]
+    let mut disable_tls_resumption = false;
 
     for (key, value) in query_pairs {
         if key == "pool_min" {
@@ -2044,6 +2074,25 @@ fn mysql_opts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                     });
                 }
             }
+        } else if key == "disable_tls_resumption" {
+            #[cfg(feature = "rustls-tls")]
+            {
+                match bool::from_str(&value) {
+                    Ok(x) => {
+                        disable_tls_resumption = x;
+                    }
+                    _ => {
+                        return Err(UrlError::InvalidParamValue {
+                            param: "disable_tls_resumption".into(),
+                            value,
+                        });
+                    }
+                }
+            }
+            #[cfg(not(feature = "rustls-tls"))]
+            {
+                return Err(UrlError::UnknownParameter { param: key });
+            }
         } else {
             return Err(UrlError::UnknownParameter { param: key });
         }
@@ -2062,6 +2111,10 @@ fn mysql_opts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
         ssl_opts.accept_invalid_certs = accept_invalid_certs;
         ssl_opts.skip_domain_validation = skip_domain_validation;
         ssl_opts.disable_built_in_roots = disable_built_in_roots;
+        #[cfg(feature = "rustls-tls")]
+        {
+            ssl_opts.disable_tls_resumption = disable_tls_resumption;
+        }
     }
 
     opts.ssl_opts = ssl_opts.map(SslOptsAndCachedConnector::new);
@@ -2199,6 +2252,17 @@ mod test {
             "mysql://localhost/foo?require_ssl=false&verify_ca=false&verify_identity=false";
         let opts = Opts::from_url(URL5).unwrap();
         assert_eq!(opts.ssl_opts(), None);
+
+        #[cfg(feature = "rustls-tls")]
+        {
+            const URL_RESUMPTION: &str =
+                "mysql://localhost/foo?require_ssl=true&disable_tls_resumption=true";
+            let opts = Opts::from_url(URL_RESUMPTION).unwrap();
+            assert_eq!(
+                opts.ssl_opts(),
+                Some(&SslOpts::default().with_disable_tls_resumption(true))
+            );
+        }
     }
 
     #[test]

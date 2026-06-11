@@ -3,7 +3,7 @@ use std::sync::Arc;
 use rustls::{
     client::{
         danger::{ServerCertVerified, ServerCertVerifier},
-        WebPkiServerVerifier,
+        Resumption, WebPkiServerVerifier,
     },
     pki_types::{pem, CertificateDer, ServerName},
     ClientConfig, RootCertStore,
@@ -51,6 +51,10 @@ impl SslOpts {
         } else {
             config_builder.with_no_client_auth()
         };
+
+        if self.disable_tls_resumption() {
+            config.resumption = Resumption::disabled();
+        }
 
         let mut dangerous = config.dangerous();
         let web_pki_verifier = WebPkiServerVerifier::builder(Arc::new(root_store))
