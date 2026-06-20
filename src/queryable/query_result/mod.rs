@@ -59,7 +59,7 @@ impl ResultSetMeta {
 /// // second result set will contain an error,
 /// // but the first result set is ok, so this line will pass
 /// conn.query_iter("DO 1; BLABLA;").await?;
-/// // `QueryResult` was dropped withot being consumed
+/// // `QueryResult` was dropped without being consumed
 ///
 /// // driver must cleanup any unconsumed result to perform another query on `conn`,
 /// // so this operation will be performed implicitly, but the unconsumed result
@@ -95,13 +95,13 @@ where
 
     /// Returns `true` if this query result may contain rows.
     ///
-    /// If `false` then no rows possible for this query tesult (e.g. result of an UPDATE query).
+    /// If `false` then no rows possible for this query result (e.g. result of an UPDATE query).
     fn has_rows(&self) -> bool {
         self.conn
             .get_pending_result()
             .map(|pending_result| match pending_result {
-                Some(PendingResult::Pending(meta)) => meta.columns().len() > 0,
-                Some(PendingResult::Taken(meta)) => meta.columns().len() > 0,
+                Some(PendingResult::Pending(meta)) => !meta.columns().is_empty(),
+                Some(PendingResult::Taken(meta)) => !meta.columns().is_empty(),
                 None => false,
             })
             .unwrap_or(false)
@@ -225,7 +225,7 @@ where
     ///
     /// It is parametrized by `R` and internally calls `R::from_row(Row)` on each row.
     ///
-    /// It will collect rows up to a neares result set boundary. This means that you should call
+    /// It will collect rows up to a nearest result set boundary. This means that you should call
     /// `collect` as many times as result sets in your query result. For example query
     /// `SELECT 'foo'; SELECT 'foo', 'bar';` will produce `QueryResult` with two result sets in it.
     /// One can use `QueryResult::is_empty` to make sure that there is no more result sets.

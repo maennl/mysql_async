@@ -9,6 +9,7 @@
 mod native_tls_opts;
 mod rustls_opts;
 
+use mysql_common::constants::MariadbCapabilities;
 #[cfg(feature = "native-tls-tls")]
 pub use native_tls_opts::ClientIdentity;
 
@@ -16,7 +17,7 @@ pub use native_tls_opts::ClientIdentity;
 pub use rustls_opts::ClientIdentity;
 
 use percent_encoding::percent_decode;
-use rand::{RngExt};
+use rand::RngExt as _;
 use tokio::sync::OnceCell;
 use url::{Host, Url};
 
@@ -220,6 +221,8 @@ pub struct SslOpts {
     skip_domain_validation: bool,
     accept_invalid_certs: bool,
     tls_hostname_override: Option<Cow<'static, str>>,
+    #[cfg(feature = "rustls-tls")]
+    disable_tls_resumption: bool,
 }
 
 impl SslOpts {
@@ -311,6 +314,26 @@ impl SslOpts {
         self
     }
 
+    /// If `true`, disables TLS session resumption.
+    /// By default TLS session resumption is enabled.
+    ///
+    /// # Connection URL
+    ///
+    /// Use `disable_tls_resumption` URL parameter to set this value:
+    ///
+    /// ```
+    /// # use mysql_async::*;
+    /// # fn main() -> Result<()> {
+    /// let opts = Opts::from_url("mysql://localhost/db?require_ssl=true&disable_tls_resumption=true")?;
+    /// assert_eq!(opts.ssl_opts().unwrap().disable_tls_resumption(), true);
+    /// # Ok(()) }
+    /// ```
+    #[cfg(feature = "rustls-tls")]
+    pub fn with_disable_tls_resumption(mut self, disable_tls_resumption: bool) -> Self {
+        self.disable_tls_resumption = disable_tls_resumption;
+        self
+    }
+
     #[cfg(any(feature = "native-tls-tls", feature = "rustls-tls"))]
     pub fn client_identity(&self) -> Option<&ClientIdentity> {
         self.client_identity.as_ref()
@@ -334,6 +357,12 @@ impl SslOpts {
 
     pub fn tls_hostname_override(&self) -> Option<&str> {
         self.tls_hostname_override.as_deref()
+    }
+
+    /// Returns `true` if TLS session resumption is disabled.
+    #[cfg(feature = "rustls-tls")]
+    pub fn disable_tls_resumption(&self) -> bool {
+        self.disable_tls_resumption
     }
 }
 
@@ -379,7 +408,7 @@ impl PoolOpts {
     ///
     /// * reset procedure removes all prepared statements, i.e. kills prepared statements cache
     /// * connection reset is quite fast but requires additional client-server roundtrip
-    ///   (might also requires requthentication for older servers)
+    ///   (might also requires reauthentication for older servers)
     ///
     /// The purpose of the reset procedure is to:
     ///
@@ -390,7 +419,7 @@ impl PoolOpts {
     /// * remove temporary tables
     /// * remove all PREPARE statement (this action kills prepared statements cache)
     ///
-    /// So to encrease overall performance you can safely opt-out of the default behavior
+    /// So to increase overall performance you can safely opt-out of the default behavior
     /// if you are not willing to change the session state in an unpleasant way.
     ///
     /// It is also possible to selectively opt-in/out using [`Conn::reset_connection`][1].
@@ -420,7 +449,7 @@ impl PoolOpts {
     }
 
     /// Sets an absolute TTL after which a connection is removed from the pool.
-    /// This may push the pool below the requested minimum pool size and is indepedent of the
+    /// This may push the pool below the requested minimum pool size and is independent of the
     /// idle TTL.
     /// The absolute TTL is disabled by default.
     /// Fractions of seconds are ignored.
@@ -561,6 +590,27 @@ pub(crate) struct InnerOpts {
     address: HostPortOrUrl,
 }
 
+/// This type alias is added to make clippy happy.
+type AfterConnectCallback =
+    Arc<dyn for<'a> Fn(&'a mut crate::Conn) -> crate::BoxFuture<'a, ()> + Send + Sync + 'static>;
+
+#[derive(Clone)]
+pub(crate) struct AfterConnectCallbackWrapper(AfterConnectCallback);
+
+impl Eq for AfterConnectCallbackWrapper {}
+
+impl PartialEq for AfterConnectCallbackWrapper {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl fmt::Debug for AfterConnectCallbackWrapper {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("AfterConnectCallbackWrapper").finish()
+    }
+}
+
 /// Mysql connection options.
 ///
 /// Build one with [`OptsBuilder`].
@@ -575,8 +625,8 @@ pub(crate) struct MysqlOpts {
     /// Database name (defaults to `None`).
     db_name: Option<String>,
 
-    /// TCP keep alive timeout in milliseconds (defaults to `None`).
-    tcp_keepalive: Option<u32>,
+    /// TCP keep alive timeout (defaults to `None`).
+    tcp_keepalive: Option<Duration>,
 
     /// Whether to enable `TCP_NODELAY` (defaults to `true`).
     ///
@@ -593,6 +643,9 @@ pub(crate) struct MysqlOpts {
     /// Pool will close a connection if time since last IO exceeds this number of seconds
     /// (defaults to `wait_timeout`).
     conn_ttl: Option<Duration>,
+
+    /// Callback to execute once a new connection is established.
+    after_connect: Option<AfterConnectCallbackWrapper>,
 
     /// Commands to execute once new connection is established.
     init: Vec<String>,
@@ -700,7 +753,7 @@ impl Opts {
                 .map_err(|_| UrlError::Invalid)?;
         }
 
-        let mysql_opts = mysqlopts_from_url(&url)?;
+        let mysql_opts = mysql_opts_from_url(&url)?;
         let address = HostPortOrUrl::Url(url);
 
         let inner_opts = InnerOpts {
@@ -713,7 +766,7 @@ impl Opts {
         })
     }
 
-    /// Address of mysql server (defaults to `127.0.0.1`). Hostnames should also work.
+    /// Address of mysql server (defaults to `127.0.0.1`). Host names should also work.
     pub fn ip_or_hostname(&self) -> &str {
         self.inner.address.get_ip_or_hostname()
     }
@@ -783,7 +836,33 @@ impl Opts {
         self.inner.mysql_opts.db_name.as_ref().map(AsRef::as_ref)
     }
 
-    /// Commands to execute once new connection is established.
+    /// Callback to execute after opening a new connection to the database. Runs
+    /// before the [`init`][Self::init] queries.
+    ///
+    /// If this returns an error, the connection attempt will also fail.
+    ///
+    /// ```no_run
+    /// use futures_util::FutureExt;
+    /// use mysql_async::OptsBuilder;
+    ///
+    /// let opts_builder: OptsBuilder = todo!();
+    ///
+    /// opts_builder.after_connect(|conn| {
+    ///     async move {
+    ///         // do something with `conn`
+    ///         Ok(())
+    ///     }.boxed()
+    /// });
+    /// ```
+    pub fn after_connect(&self) -> Option<AfterConnectCallback> {
+        self.inner
+            .mysql_opts
+            .after_connect
+            .as_ref()
+            .map(|cb| cb.0.clone())
+    }
+
+    /// Commands to execute once new a connection is established.
     pub fn init(&self) -> &[String] {
         self.inner.mysql_opts.init.as_ref()
     }
@@ -807,10 +886,10 @@ impl Opts {
     /// # use mysql_async::*;
     /// # fn main() -> Result<()> {
     /// let opts = Opts::from_url("mysql://localhost/db?tcp_keepalive=10000")?;
-    /// assert_eq!(opts.tcp_keepalive(), Some(10_000));
+    /// assert_eq!(opts.tcp_keepalive(), Some(std::time::Duration::from_secs(10)));
     /// # Ok(()) }
     /// ```
-    pub fn tcp_keepalive(&self) -> Option<u32> {
+    pub fn tcp_keepalive(&self) -> Option<Duration> {
         self.inner.mysql_opts.tcp_keepalive
     }
 
@@ -939,21 +1018,21 @@ impl Opts {
     ///
     /// # Connection URL parameters
     ///
-    /// Note that for securty reasons:
+    /// Note that for security reasons:
     ///
     /// * CA and IDENTITY verifications are opt-out
-    /// * there is no way to give an idenity or root certs via query URL
+    /// * there is no way to give an identity or root certs via query URL
     ///
     /// URL Parameters:
     ///
     /// *   `require_ssl: bool` (defaults to `false`) – requires SSL with default [`SslOpts`]
     /// *   `verify_ca: bool` (defaults to `true`) – requires server Certificate Authority (CA)
     ///     certificate validation against the configured CA certificates.
-    ///     Makes no sence if  `require_ssl` equals `false`.
+    ///     Makes no sense if  `require_ssl` equals `false`.
     /// *   `verify_identity: bool` (defaults to `true`) – perform host name identity verification
     ///     by checking the host name the client uses for connecting to the server against
     ///     the identity in the certificate that the server sends to the client.
-    ///     Makes no sence if  `require_ssl` equals `false`.
+    ///     Makes no sense if  `require_ssl` equals `false`.
     ///
     ///
     pub fn ssl_opts(&self) -> Option<&SslOpts> {
@@ -1126,6 +1205,12 @@ impl Opts {
         out
     }
 
+    pub(crate) fn get_mariadb_capabilities(&self) -> MariadbCapabilities {
+        MariadbCapabilities::MARIADB_CLIENT_STMT_BULK_OPERATIONS
+            | MariadbCapabilities::MARIADB_CLIENT_CACHE_METADATA
+            | MariadbCapabilities::MARIADB_CLIENT_BULK_UNIT_RESULTS
+    }
+
     pub(crate) fn ssl_opts_and_connector(&self) -> Option<&SslOptsAndCachedConnector> {
         self.inner.mysql_opts.ssl_opts.as_ref()
     }
@@ -1137,6 +1222,7 @@ impl Default for MysqlOpts {
             user: None,
             pass: None,
             db_name: None,
+            after_connect: None,
             init: vec![],
             setup: vec![],
             tcp_keepalive: None,
@@ -1352,6 +1438,15 @@ impl OptsBuilder {
         self
     }
 
+    /// Defines a callback that runs after connection. See [`Opts::after_connect`].
+    pub fn after_connect<F>(mut self, callback: F) -> Self
+    where
+        F: for<'a> Fn(&'a mut crate::Conn) -> crate::BoxFuture<'a, ()> + Send + Sync + 'static,
+    {
+        self.opts.after_connect = Some(AfterConnectCallbackWrapper(Arc::new(callback)));
+        self
+    }
+
     /// Defines initial queries. See [`Opts::init`].
     pub fn init<T: Into<String>>(mut self, init: Vec<T>) -> Self {
         self.opts.init = init.into_iter().map(Into::into).collect();
@@ -1365,8 +1460,8 @@ impl OptsBuilder {
     }
 
     /// Defines `tcp_keepalive` option. See [`Opts::tcp_keepalive`].
-    pub fn tcp_keepalive<T: Into<u32>>(mut self, tcp_keepalive: Option<T>) -> Self {
-        self.opts.tcp_keepalive = tcp_keepalive.map(Into::into);
+    pub fn tcp_keepalive(mut self, tcp_keepalive: Option<Duration>) -> Self {
+        self.opts.tcp_keepalive = tcp_keepalive;
         self
     }
 
@@ -1702,7 +1797,7 @@ fn from_url_basic(url: &Url) -> std::result::Result<(MysqlOpts, Vec<(String, Str
     Ok((opts, query_pairs))
 }
 
-fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
+fn mysql_opts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
     let (mut opts, query_pairs): (MysqlOpts, _) = from_url_basic(url)?;
     let mut pool_min = DEFAULT_POOL_CONSTRAINTS.min;
     let mut pool_max = DEFAULT_POOL_CONSTRAINTS.max;
@@ -1711,6 +1806,8 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
     let mut skip_domain_validation = false;
     let mut accept_invalid_certs = false;
     let mut disable_built_in_roots = false;
+    #[cfg(feature = "rustls-tls")]
+    let mut disable_tls_resumption = false;
 
     for (key, value) in query_pairs {
         if key == "pool_min" {
@@ -1801,10 +1898,10 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
             }
         } else if key == "tcp_keepalive" {
             match u32::from_str(&value) {
-                Ok(value) => opts.tcp_keepalive = Some(value),
+                Ok(value) => opts.tcp_keepalive = Some(Duration::from_millis(value.into())),
                 _ => {
                     return Err(UrlError::InvalidParamValue {
-                        param: "tcp_keepalive_ms".into(),
+                        param: "tcp_keepalive".into(),
                         value,
                     });
                 }
@@ -1977,6 +2074,25 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                     });
                 }
             }
+        } else if key == "disable_tls_resumption" {
+            #[cfg(feature = "rustls-tls")]
+            {
+                match bool::from_str(&value) {
+                    Ok(x) => {
+                        disable_tls_resumption = x;
+                    }
+                    _ => {
+                        return Err(UrlError::InvalidParamValue {
+                            param: "disable_tls_resumption".into(),
+                            value,
+                        });
+                    }
+                }
+            }
+            #[cfg(not(feature = "rustls-tls"))]
+            {
+                return Err(UrlError::UnknownParameter { param: key });
+            }
         } else {
             return Err(UrlError::UnknownParameter { param: key });
         }
@@ -1995,6 +2111,10 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
         ssl_opts.accept_invalid_certs = accept_invalid_certs;
         ssl_opts.skip_domain_validation = skip_domain_validation;
         ssl_opts.disable_built_in_roots = disable_built_in_roots;
+        #[cfg(feature = "rustls-tls")]
+        {
+            ssl_opts.disable_tls_resumption = disable_tls_resumption;
+        }
     }
 
     opts.ssl_opts = ssl_opts.map(SslOptsAndCachedConnector::new);
@@ -2132,6 +2252,17 @@ mod test {
             "mysql://localhost/foo?require_ssl=false&verify_ca=false&verify_identity=false";
         let opts = Opts::from_url(URL5).unwrap();
         assert_eq!(opts.ssl_opts(), None);
+
+        #[cfg(feature = "rustls-tls")]
+        {
+            const URL_RESUMPTION: &str =
+                "mysql://localhost/foo?require_ssl=true&disable_tls_resumption=true";
+            let opts = Opts::from_url(URL_RESUMPTION).unwrap();
+            assert_eq!(
+                opts.ssl_opts(),
+                Some(&SslOpts::default().with_disable_tls_resumption(true))
+            );
+        }
     }
 
     #[test]

@@ -125,6 +125,38 @@ SSL support comes in two flavors:
 
 There is a set of url-parameters supported by the driver (see documentation on [`Opts`]).
 
+URL parameters for [`PoolOpts`]:
+
+* pool_min — see [`PoolConstraints::new`], [`PoolConstraints::min`]
+* pool_max — see [`PoolConstraints::new`], [`PoolConstraints::max`]
+* inactive_connection_ttl — see [`PoolOpts::with_inactive_connection_ttl`]
+* ttl_check_interval — see [`PoolOpts::with_ttl_check_interval`]
+* abs_conn_ttl — see [`PoolOpts::with_abs_conn_ttl`]
+* abs_conn_ttl_jitter — see [`PoolOpts::with_abs_conn_ttl_jitter`]
+* reset_connection — see [`PoolOpts::with_reset_connection`]
+
+URL parameters for [`Opts`]:
+
+* conn_ttl — see [`Opts::conn_ttl`]
+* tcp_keepalive — see [`Opts::tcp_keepalive`]
+* max_allowed_packet — see [`Opts::max_allowed_packet`]
+* wait_timeout — see [`Opts::wait_timeout`]
+* enable_cleartext_plugin — see [`Opts::enable_cleartext_plugin`]
+* tcp_nodelay — see [`Opts::tcp_nodelay`]
+* stmt_cache_size  — see [`Opts::stmt_cache_size`]
+* prefer_socket  — see [`Opts::prefer_socket`]
+* secure_auth  — see [`Opts::secure_auth`]
+* client_found_rows  — see [`Opts::client_found_rows`]
+* socket  — see [`Opts::socket`]
+* compression  — see [`Opts::compression`]
+* require_ssl  — see [`Opts::ssl_opts`]
+
+URL parameters for [`SslOpts`]:
+* verify_ca  — see [`SslOpts::with_danger_accept_invalid_certs`]
+* verify_identity  — see [`SslOpts::with_danger_skip_domain_validation`]
+* built_in_roots  — see [`SslOpts::with_disable_built_in_roots`]
+* disable_tls_resumption  — (requires `rustls-tls` feature) see [`SslOpts::with_disable_tls_resumption`]
+
 ## Example
 
 ```rust

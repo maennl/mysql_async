@@ -7,10 +7,11 @@
 // modified, or distributed except according to those terms.
 
 use futures_util::FutureExt;
-//pub use mysql_common::named_params;
 
 use mysql_common::{
-    constants::{DEFAULT_MAX_ALLOWED_PACKET, UTF8MB4_GENERAL_CI, UTF8_GENERAL_CI},
+    constants::{
+        MariadbCapabilities, DEFAULT_MAX_ALLOWED_PACKET, UTF8MB4_GENERAL_CI, UTF8_GENERAL_CI,
+    },
     crypto,
     io::ParseBuf,
     packets::{
@@ -58,7 +59,7 @@ pub mod stmt_cache;
 
 const DEFAULT_WAIT_TIMEOUT: usize = 28800;
 
-/// Helper that asynchronously disconnects the givent connection on the default tokio executor.
+/// Helper that asynchronously disconnects the given connection on the default tokio executor.
 fn disconnect(mut conn: Conn) {
     let disconnected = conn.inner.disconnected;
 
@@ -100,6 +101,7 @@ struct ConnInner {
     version: (u16, u16, u16),
     socket: Option<String>,
     capabilities: CapabilityFlags,
+    mariadb_capabilities: MariadbCapabilities,
     status: StatusFlags,
     last_ok_packet: Option<OkPacket<'static>>,
     last_err_packet: Option<mysql_common::packets::ServerError<'static>>,
@@ -137,6 +139,8 @@ impl fmt::Debug for ConnInner {
             .field("options", &self.opts)
             .field("server_key", &self.server_key)
             .field("auth_plugin", &self.auth_plugin)
+            .field("capabilities", &self.capabilities)
+            .field("mariadb_capabilities", &self.mariadb_capabilities)
             .finish()
     }
 }
@@ -146,7 +150,8 @@ impl ConnInner {
     fn empty(opts: Opts) -> ConnInner {
         let ttl_deadline = opts.pool_opts().new_connection_ttl_deadline();
         ConnInner {
-            capabilities: opts.get_capabilities(),
+            capabilities: CapabilityFlags::empty(),
+            mariadb_capabilities: MariadbCapabilities::empty(),
             status: StatusFlags::empty(),
             last_ok_packet: None,
             last_err_packet: None,
@@ -181,6 +186,12 @@ impl ConnInner {
     fn stream_mut(&mut self) -> Result<&mut Stream> {
         self.stream
             .as_mut()
+            .ok_or_else(|| DriverError::ConnectionClosed.into())
+    }
+
+    fn stream_ref(&self) -> Result<&Stream> {
+        self.stream
+            .as_ref()
             .ok_or_else(|| DriverError::ConnectionClosed.into())
     }
 }
@@ -252,12 +263,24 @@ impl Conn {
         self.inner.reset_upon_returning_to_a_pool = reset_connection;
     }
 
+    pub(crate) fn stream_ref(&self) -> Result<&Stream> {
+        self.inner.stream_ref()
+    }
+
     pub(crate) fn stream_mut(&mut self) -> Result<&mut Stream> {
         self.inner.stream_mut()
     }
 
     pub(crate) fn capabilities(&self) -> CapabilityFlags {
         self.inner.capabilities
+    }
+
+    pub(crate) fn has_capabilities(&self, c: CapabilityFlags) -> bool {
+        self.inner.capabilities.contains(c)
+    }
+
+    pub(crate) fn has_mariadb_capabilities(&self, c: MariadbCapabilities) -> bool {
+        self.inner.mariadb_capabilities.contains(c)
     }
 
     /// Will update last IO time for this connection.
@@ -272,7 +295,7 @@ impl Conn {
         }
     }
 
-    /// Will syncronize sequence ids between compressed and uncompressed codecs.
+    /// Will synchronize sequence ids between compressed and uncompressed codecs.
     pub(crate) fn sync_seq_id(&mut self) {
         if let Some(stream) = self.inner.stream.as_mut() {
             stream.sync_seq_id();
@@ -334,7 +357,7 @@ impl Conn {
         self.inner.pending_result.is_err() || matches!(self.inner.pending_result, Ok(Some(_)))
     }
 
-    /// Sets the given pening result metadata for this connection. Returns the previous value.
+    /// Sets the given pending result metadata for this connection. Returns the previous value.
     pub(crate) fn set_pending_result(
         &mut self,
         meta: Option<ResultSetMeta>,
@@ -375,7 +398,7 @@ impl Conn {
         self.inner.status
     }
 
-    pub(crate) async fn routine<'a, F, T>(&mut self, mut f: F) -> crate::Result<T>
+    pub(crate) async fn routine<'a, F, T>(&mut self, f: F) -> crate::Result<T>
     where
         F: Routine<T> + 'a,
     {
@@ -516,6 +539,13 @@ impl Conn {
         self.inner.id = handshake.connection_id();
         self.inner.status = handshake.status_flags();
 
+        // If we have a MariaDB server version, we are using mariadb extended capabilities from the handshake packet.
+        // MariaDB does not set the first standard capability flag bit to indicate that it supports extended capabilities.
+        if self.inner.is_mariadb && !self.has_capabilities(CapabilityFlags::CLIENT_LONG_PASSWORD) {
+            self.inner.mariadb_capabilities =
+                handshake.mariadb_ext_capabilities() & self.inner.opts.get_mariadb_capabilities();
+        }
+
         // Allow only CachingSha2Password and MysqlNativePassword here
         // because sha256_password is deprecated and other plugins won't
         // appear here.
@@ -534,11 +564,7 @@ impl Conn {
             .get_capabilities()
             .contains(CapabilityFlags::CLIENT_SSL)
         {
-            if !self
-                .inner
-                .capabilities
-                .contains(CapabilityFlags::CLIENT_SSL)
-            {
+            if !self.has_capabilities(CapabilityFlags::CLIENT_SSL) {
                 return Err(DriverError::NoClientSslFlagFromServer.into());
             }
 
@@ -552,7 +578,8 @@ impl Conn {
                 self.inner.capabilities,
                 DEFAULT_MAX_ALLOWED_PACKET as u32,
                 collation as u8,
-            );
+            )
+            .with_mariadb_capabilities(self.inner.mariadb_capabilities);
             self.write_struct(&ssl_request).await?;
             let conn = self;
             let ssl_opts = conn.opts().ssl_opts_and_connector().expect("unreachable");
@@ -589,7 +616,8 @@ impl Conn {
                 .opts
                 .max_allowed_packet()
                 .unwrap_or(DEFAULT_MAX_ALLOWED_PACKET) as u32,
-        );
+        )
+        .with_mariadb_ext_capabilities(self.inner.mariadb_capabilities);
 
         // Serialize here to satisfy borrow checker.
         let mut buf = crate::buffer_pool().get();
@@ -640,6 +668,8 @@ impl Conn {
                     }
                 }
                 x @ AuthPlugin::Ed25519 => x.gen_data(self.inner.opts.pass(), &self.inner.nonce),
+                // For parsec at this point we need to send an empty packet first
+                _x @ AuthPlugin::MariadbParsec { .. } => None,
                 x @ AuthPlugin::Other(_) => x.gen_data(self.inner.opts.pass(), &self.inner.nonce),
             };
 
@@ -682,6 +712,10 @@ impl Conn {
                     self.continue_ed25519_auth().await?;
                     Ok(())
                 }
+                AuthPlugin::MariadbParsec { .. } => {
+                    self.continue_parsec_auth().await?;
+                    Ok(())
+                }
                 AuthPlugin::Other(ref name) => Err(DriverError::UnknownAuthPlugin {
                     name: String::from_utf8_lossy(name.as_ref()).to_string(),
                 }
@@ -691,10 +725,7 @@ impl Conn {
     }
 
     fn switch_to_compression(&mut self) -> Result<()> {
-        if self
-            .capabilities()
-            .contains(CapabilityFlags::CLIENT_COMPRESS)
-        {
+        if self.has_capabilities(CapabilityFlags::CLIENT_COMPRESS) {
             if let Some(compression) = self.inner.opts.compression() {
                 if let Some(stream) = self.inner.stream.as_mut() {
                     stream.compress(compression);
@@ -719,6 +750,45 @@ impl Conn {
                 payload: packet.to_vec(),
             }
             .into()),
+        }
+    }
+
+    async fn continue_parsec_auth(&mut self) -> Result<()> {
+        let packet = self.read_packet().await?;
+        // Normally we need to skip escaping 0x01 byte. But in first parsec implementations, server did not send it.
+        let mut payload: &[u8] = &packet;
+        if packet.first() == Some(&0x01) {
+            payload = &packet[1..];
+        }
+        // At this point in future, when it will be possible for parsec to be default authentication method,
+        // we can have authentication switch request. The other possible option here(and for now the only option) -
+        // ext-salt packet.
+        if payload.first() == Some(&0xfe) {
+            let auth_switch_request = ParseBuf(payload).parse(())?;
+            self.perform_auth_switch(auth_switch_request).await
+        } else {
+            // Letting parser function decide if all is fine with the packet
+            self.inner
+                .auth_plugin
+                .read_add_data(payload)
+                .ok_or_else(|| DriverError::InvalidParsecSalt)?;
+            // Now generating response.
+            let plugin_data = self
+                .inner
+                .auth_plugin
+                .gen_data(self.inner.opts.pass(), &self.inner.nonce)
+                .unwrap();
+
+            self.write_struct(&plugin_data.into_owned()).await?;
+            // After client response, server will send either ok or error.
+            let payload = self.read_packet().await?;
+            match payload.first() {
+                Some(0x00) => Ok(()),
+                _ => Err(DriverError::UnexpectedPacket {
+                    payload: payload.to_vec(),
+                }
+                .into()),
+            }
         }
     }
 
@@ -803,10 +873,7 @@ impl Conn {
     /// Returns `true` for ProgressReport packet.
     fn handle_packet(&mut self, packet: &PooledBuf) -> Result<bool> {
         let ok_packet = if self.has_pending_result() {
-            if self
-                .capabilities()
-                .contains(CapabilityFlags::CLIENT_DEPRECATE_EOF)
-            {
+            if self.has_capabilities(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
                 ParseBuf(packet)
                     .parse::<OkPacketDeserializer<ResultSetTerminator>>(self.capabilities())
                     .map(|x| x.into_inner())
@@ -930,6 +997,10 @@ impl Conn {
     }
 
     async fn run_init_commands(&mut self) -> Result<()> {
+        if let Some(callback) = self.inner.opts.after_connect() {
+            callback(self).await?;
+        }
+
         let mut init = self.inner.opts.init().to_vec();
 
         while let Some(query) = init.pop() {
@@ -963,9 +1034,7 @@ impl Conn {
                 #[cfg(not(unix))]
                 return Err(crate::DriverError::NamedPipesDisabled.into());
             } else {
-                let keepalive = opts
-                    .tcp_keepalive()
-                    .map(|x| std::time::Duration::from_millis(x.into()));
+                let keepalive = opts.tcp_keepalive();
                 Stream::connect_tcp(opts.hostport_or_url(), keepalive).await?
             };
 
@@ -1253,7 +1322,7 @@ impl Conn {
     }
 
     /// The purpose of this function is to cleanup a pending result set
-    /// for prematurely dropeed connection or query result.
+    /// for prematurely dropped connection or query result.
     ///
     /// Requires that there are no other references to the pending result.
     pub(crate) async fn drop_result(&mut self) -> Result<()> {
@@ -1263,7 +1332,7 @@ impl Conn {
             Some(PendingResult::Taken(meta)) => {
                 // This also asserts that there is only one reference left to the taken ResultSetMeta,
                 // therefore this result set must be dropped here since it won't be dropped anywhere else.
-                Some(Arc::try_unwrap(meta).expect("Conn::drop_result call on a pending result that may still be droped by someone else"))
+                Some(Arc::try_unwrap(meta).expect("Conn::drop_result call on a pending result that may still be dropped by someone else"))
             }
             None => None,
         };
@@ -1318,9 +1387,12 @@ impl Conn {
 #[cfg(test)]
 mod test {
     use bytes::Bytes;
-    use futures_util::stream::{self, StreamExt};
-    use mysql_common::constants::MAX_PAYLOAD_LEN;
-    use rand::RngExt;
+    use futures_util::{
+        stream::{self, StreamExt},
+        FutureExt,
+    };
+    use mysql_common::constants::{MariadbCapabilities, MAX_PAYLOAD_LEN};
+    use rand::RngExt as _;
     use tokio::{io::AsyncWriteExt, net::TcpListener};
 
     use crate::{
@@ -1403,7 +1475,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn should_clean_state_if_wrapper_is_dropeed() -> super::Result<()> {
+    async fn should_clean_state_if_wrapper_is_dropped() -> super::Result<()> {
         let mut conn: Conn = Conn::new(get_opts()).await?;
 
         conn.query_drop("CREATE TEMPORARY TABLE mysql.foo (id SERIAL)")
@@ -1523,6 +1595,35 @@ mod test {
     }
 
     #[tokio::test]
+    async fn should_execute_after_connect_callback_on_new_connection() -> super::Result<()> {
+        let opts = OptsBuilder::from_opts(get_opts()).after_connect(|conn| {
+            async move {
+                conn.query_drop("SET @a = 42").await?;
+                conn.query_drop("SET @b = 'foo'").await?;
+                Ok(())
+            }
+            .boxed()
+        });
+        let mut conn = Conn::new(opts).await?;
+        let result: Vec<(u8, String)> = conn.query("SELECT @a, @b").await?;
+        conn.disconnect().await?;
+        assert_eq!(result, vec![(42, "foo".into())]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn should_propagate_after_connect_callback_error() -> super::Result<()> {
+        let opts = OptsBuilder::from_opts(get_opts())
+            .after_connect(|_conn| async move { Err(Error::Other("rejected".into())) }.boxed());
+        let e = Conn::new(opts).await.unwrap_err();
+        match e {
+            Error::Other(e) => assert_eq!(e.to_string(), "rejected"),
+            e => panic!("expected error from after_connect(), got {e:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn should_execute_setup_queries_on_reset() -> super::Result<()> {
         let opts = OptsBuilder::from_opts(get_opts()).setup(vec!["SET @a = 42", "SET @b = 'foo'"]);
         let mut conn = Conn::new(opts).await?;
@@ -1586,7 +1687,7 @@ mod test {
         type CreateUserFn = fn(bool, (u16, u16, u16), &str) -> Vec<String>;
 
         #[allow(clippy::type_complexity)]
-        const TEST_MATRIX: [(&str, ShouldRunFn, CreateUserFn); 4] = [
+        const TEST_MATRIX: [(&str, ShouldRunFn, CreateUserFn); 5] = [
             (
                 "mysql_old_password",
                 |is_mariadb, version| is_mariadb || version < (5, 7, 0),
@@ -1649,6 +1750,15 @@ mod test {
                 |_is_mariadb, _version, pass| {
                     vec![format!(
                         "CREATE USER '__mats'@'%' IDENTIFIED WITH ed25519 AS PASSWORD('{pass}')"
+                    )]
+                },
+            ),
+            (
+                "parsec",
+                |is_mariadb, version| is_mariadb && version >= (11, 4, 1),
+                |_is_mariadb, _version, pass| {
+                    vec![format!(
+                        "CREATE USER '__mats'@'%' IDENTIFIED WITH parsec AS PASSWORD('{pass}')"
                     )]
                 },
             ),
@@ -1729,6 +1839,162 @@ mod test {
             }
         }
 
+        Ok(())
+    }
+
+    // Test for exec_batch method.
+    #[tokio::test]
+    async fn test_exec_batch() {
+        let mut conn = Conn::new(get_opts()).await.unwrap();
+
+        conn.query_drop(
+            "CREATE TEMPORARY TABLE t_exec_batch (\
+                    id INT NOT NULL PRIMARY KEY,\
+                    val VARCHAR(32),\
+                    num BIGINT UNSIGNED)",
+        )
+        .await
+        .unwrap();
+
+        // Populating table with some data to verify that data still fetched correctly with cached metadata use
+        let insert_stmt = "INSERT INTO t_exec_batch (id,val,num) VALUES (?,?,?)";
+
+        let params = [
+            (1, Some("First"), None),
+            (3, None, Some(1)),
+            (4, Some("Third"), Some(u64::MAX)),
+        ];
+
+        conn.exec_batch(insert_stmt, params.iter().copied())
+            .await
+            .unwrap();
+
+        conn.exec_batch(insert_stmt, [(8, None::<String>, None::<u64>)])
+            .await
+            .unwrap();
+
+        let fetched_rows: Vec<(i32, Option<String>, Option<u64>)> = conn
+            .query_iter("SELECT id, val, num FROM t_exec_batch")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let expected_rows: Vec<(i32, Option<String>, Option<u64>)> = vec![
+            (1, Some("First".to_string()), None),
+            (3, None, Some(1)),
+            (4, Some("Third".to_string()), Some(u64::MAX)),
+            (8, None, None),
+        ];
+        assert_eq!(fetched_rows, expected_rows);
+
+        if conn.has_mariadb_capabilities(MariadbCapabilities::MARIADB_CLIENT_STMT_BULK_OPERATIONS) {
+            let select_stmt = "SELECT ?";
+            let err = conn
+                .exec_batch(select_stmt, [(1_u64,), (2_u64,), (3_u64,)])
+                .await
+                .unwrap_err();
+            assert!(matches!(err, crate::Error::Server(e) if e.code == 1295));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exec_batch_large() {
+        const CLIENT_MAX_PACKET_SIZE: usize = 1024; // 1K
+        let opts = get_opts().max_allowed_packet(Some(CLIENT_MAX_PACKET_SIZE));
+        let mut conn = Conn::new(opts).await.unwrap();
+        conn.query_drop(
+            "CREATE TEMPORARY TABLE t_large_batch (id BIGINT NOT NULL PRIMARY KEY,
+                val VARCHAR(1024) NOT NULL)",
+        )
+        .await
+        .unwrap();
+
+        // Calculate a row size that will make the total packet size > max_allowed_packet
+        // Packet will have 4 byte header and 7 bytes COM_STMT_BULK_EXECUTE fields + 4 bytes for parameter types
+        // 8 bytes per row for id + 2 bytes for indicators + 3 bytes for length encoding of val.
+        let num_rows = 3;
+        let row_chunk_size = CLIENT_MAX_PACKET_SIZE / num_rows;
+        let mut row_data_1 = "a".repeat(row_chunk_size);
+        let row_data_2 = "b".repeat(row_chunk_size);
+        let row_data_3 = "c".repeat(row_chunk_size);
+
+        let evaluated_packet_len = 4 + 7 + 4 + (1 + 8 + 1 + 3 + row_chunk_size * num_rows);
+
+        assert!(
+            evaluated_packet_len > CLIENT_MAX_PACKET_SIZE,
+            "Data size must be greater than max packet size"
+        );
+
+        let params: Vec<(u64, &str)> = vec![
+            (1, &row_data_1[..]),
+            (7, &row_data_2[..]),
+            (22, &row_data_3[..]),
+        ];
+
+        let query = "INSERT INTO t_large_batch (id, val) VALUES (?,?)";
+        conn.exec_batch(query, params)
+            .await
+            .expect("Batch execution should succeed");
+
+        // MySql compression does not respect max_allowed_packet, so we're going to query
+        // one by one
+        let mut inserted_rows: Vec<(u64, String)> = vec![];
+        inserted_rows.extend(
+            conn.query("SELECT id, val FROM t_large_batch ORDER BY id LIMIT 1 OFFSET 0")
+                .await
+                .unwrap(),
+        );
+        inserted_rows.extend(
+            conn.query("SELECT id, val FROM t_large_batch ORDER BY id LIMIT 1 OFFSET 1")
+                .await
+                .unwrap(),
+        );
+        inserted_rows.extend(
+            conn.query("SELECT id, val FROM t_large_batch ORDER BY id LIMIT 65536 OFFSET 2")
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(
+            inserted_rows.len(),
+            num_rows,
+            "The number of inserted rows ({}) does not match the expected number ({})",
+            inserted_rows.len(),
+            num_rows
+        );
+
+        assert_eq!(inserted_rows[0], (1, row_data_1));
+        assert_eq!(inserted_rows[1], (7, row_data_2));
+        assert_eq!(inserted_rows[2], (22, row_data_3));
+
+        // Some corner cases: single row exceeding max_allowed_packet and
+        // empty batch
+        row_data_1 = "x".repeat(CLIENT_MAX_PACKET_SIZE);
+        let params: Vec<(u64, &str)> = vec![(33, &row_data_1[..])];
+        let result = conn.exec_batch(query, params).await;
+        assert!(
+            result.is_err(),
+            "Batch execution should fail due to packet size exceeding max_allowed_packet"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exec_batch_no_params() -> crate::Result<()> {
+        let mut conn = Conn::new(get_opts()).await.unwrap();
+        conn.query_drop("CREATE TEMPORARY TABLE t_counter (counter INTEGER NOT NULL)")
+            .await
+            .unwrap();
+        conn.query_drop("INSERT INTO t_counter (counter) VALUES (0)")
+            .await
+            .unwrap();
+
+        const COUNT: usize = 10;
+        conn.exec_batch("UPDATE t_counter SET counter = counter+1", vec![(); COUNT])
+            .await
+            .expect("Batch execution should succeed");
+        let rows: Vec<(usize,)> = conn.query("SELECT counter FROM t_counter").await.unwrap();
+        assert_eq!(rows, vec![(COUNT,)]);
         Ok(())
     }
 
@@ -2338,6 +2604,192 @@ mod test {
                 message: error_message.to_owned(),
             }
         );
+    }
+
+    #[cfg_attr(docsrs, doc(cfg(feature = "client_parsec")))]
+    #[tokio::test]
+    #[cfg(feature = "client_parsec")]
+    async fn parsec_connect() {
+        let mut conn = Conn::new(get_opts()).await.unwrap();
+        let is_mariadb = conn.inner.is_mariadb;
+        let version = conn.server_version();
+        if is_mariadb && version >= (11, 4, 1) {
+            // Creating random password so in case of test failure user won't have
+            // known password left behind.
+            let mut rng = rand::rng();
+            let mut pass_bytes = [0u8; 16];
+            rng.fill(&mut pass_bytes);
+            pass_bytes.iter_mut().for_each(|b| {
+                *b = match *b % 3 {
+                    0 => b'A' + (*b % 26),
+                    1 => b'a' + (*b % 26),
+                    _ => b'0' + (*b % 10),
+                }
+            });
+            let pass = String::from_utf8_lossy(&pass_bytes).to_string();
+
+            conn.query_drop("DROP USER IF EXISTS 'parsec_test_user'@'%'")
+                .await
+                .unwrap();
+            let create_user_query = format!(
+                "CREATE USER 'parsec_test_user'@'%' IDENTIFIED VIA 'parsec' USING PASSWORD('{}')",
+                pass
+            );
+            conn.query_drop(create_user_query).await.unwrap();
+            let mut conn_parsec = Conn::new(
+                get_opts()
+                    .user(Some("parsec_test_user"))
+                    .pass(Some(pass))
+                    .db_name(None::<String>)
+                    .init(vec![] as Vec<String>),
+            )
+            .await
+            .unwrap();
+            assert!(conn_parsec.ping().await.is_ok());
+            conn.query_drop("DROP USER 'parsec_test_user'@'%'")
+                .await
+                .unwrap();
+        }
+    }
+
+    // This test verifies that the metadata is correct with or without metadata caching, and that protocol
+    // is not broken afterwards and data is read correctly. It doesn't test that the metadata is really cached
+    // (if that is possible) and not received twice.
+    #[tokio::test]
+    async fn test_metadata_caching() {
+        use crate::consts::ColumnType;
+        let mut conn = Conn::new(get_opts()).await.unwrap();
+        if !conn.inner.is_mariadb {
+            return;
+        }
+
+        conn.query_drop(
+            r"CREATE TEMPORARY TABLE t_metadata_caching (
+                id INT NOT NULL PRIMARY KEY AUTO_INCREMENT,
+                val VARCHAR(32) NOT NULL)",
+        )
+        .await
+        .unwrap();
+
+        // Populating table with some data to verify that data still fetched correctly with cached metadata use
+        let insert_stmt = conn
+            .prep("INSERT INTO t_metadata_caching (val) VALUES (?)")
+            .await
+            .unwrap();
+        let _ = conn.exec_drop(&insert_stmt, ("AAA",)).await;
+        let _ = conn.exec_drop(&insert_stmt, ("BB",)).await;
+        let mut ps = conn
+            .prep("SELECT id, val FROM t_metadata_caching")
+            .await
+            .unwrap();
+
+        let mut columns_from_prep = ps.columns();
+        let mut metadata_from_prep: Vec<(String, ColumnType)> = columns_from_prep
+            .iter()
+            .map(|column| (column.name_str().to_string(), column.column_type()))
+            .collect();
+
+        let mut query_result = conn.exec_iter(&ps, ()).await.unwrap();
+        let mut columns_from_exec1 = query_result.columns().unwrap();
+        let mut metadata_from_exec1: Vec<(String, ColumnType)> = columns_from_exec1
+            .iter()
+            .map(|column| (column.name_str().to_string(), column.column_type()))
+            .collect();
+
+        // Comparing and verifying metadata.
+        assert_eq!(metadata_from_prep, metadata_from_exec1);
+        assert_eq!(metadata_from_prep.len(), 2);
+        assert_eq!(metadata_from_prep[0].0, "id");
+        assert_eq!(metadata_from_prep[0].1, ColumnType::MYSQL_TYPE_LONG);
+        assert_eq!(metadata_from_prep[1].0, "val");
+        assert_eq!(metadata_from_prep[1].1, ColumnType::MYSQL_TYPE_VAR_STRING);
+
+        let fetched_rows: Vec<(i32, String)> = query_result.collect().await.unwrap();
+
+        let expected_rows = [(1, "AAA".to_string()), (2, "BB".to_string())];
+        assert_eq!(fetched_rows.len(), expected_rows.len());
+
+        for (fetched, expected) in fetched_rows.iter().zip(expected_rows.iter()) {
+            assert_eq!(fetched, expected);
+        }
+
+        // Doing the same for exec_first. Technically it's internally the same as exec_iter,
+        // but the test isn't supposed to know that and to test it
+        ps = conn
+            .prep("SELECT val FROM t_metadata_caching WHERE id = ?")
+            .await
+            .unwrap();
+        columns_from_prep = ps.columns();
+        metadata_from_prep = columns_from_prep
+            .iter()
+            .map(|column| (column.name_str().to_string(), column.column_type()))
+            .collect();
+        let single_row: Option<String> = conn.exec_first(&ps, (1,)).await.unwrap();
+        if let Some(val) = single_row {
+            assert_eq!(metadata_from_prep.len(), 1);
+            assert_eq!(metadata_from_prep[0].0, "val");
+            assert_eq!(metadata_from_prep[0].1, ColumnType::MYSQL_TYPE_VAR_STRING);
+
+            assert_eq!(val, "AAA".to_string());
+        }
+        // Testing the case when metadata is changed after execution
+        ps = conn.prep("SELECT ?").await.unwrap();
+
+        columns_from_prep = ps.columns();
+        metadata_from_prep = columns_from_prep
+            .iter()
+            .map(|column| (column.name_str().to_string(), column.column_type()))
+            .collect();
+
+        // First query — server sends metadata because the type has changed
+        query_result = conn.exec_iter(&ps, (12,)).await.unwrap();
+        columns_from_exec1 = query_result.columns().unwrap();
+        metadata_from_exec1 = columns_from_exec1
+            .iter()
+            .map(|column| (column.name_str().to_string(), column.column_type()))
+            .collect();
+        let fetched_rows: Vec<i32> = query_result.collect().await.unwrap();
+
+        // Second query — server skips metadata packets
+        query_result = conn.exec_iter(&ps, (42,)).await.unwrap();
+        let columns_from_exec2 = query_result.columns().unwrap();
+        let metadata_from_exec2 = columns_from_exec2
+            .iter()
+            .map(|column| (column.name_str().to_string(), column.column_type()))
+            .collect::<Vec<_>>();
+        let fetched_rows2: Vec<i32> = query_result.collect().await.unwrap();
+
+        // Third query — server sends metadata because the type has changed
+        query_result = conn.exec_iter(&ps, ("foo",)).await.unwrap();
+        let columns_from_exec3 = query_result.columns().unwrap();
+        let metadata_from_exec3 = columns_from_exec3
+            .iter()
+            .map(|column| (column.name_str().to_string(), column.column_type()))
+            .collect::<Vec<_>>();
+        let fetched_rows3: Vec<String> = query_result.collect().await.unwrap();
+
+        // Comparing and verifying metadata.
+        assert_eq!(metadata_from_exec1.len(), 1);
+        assert_eq!(metadata_from_exec2.len(), 1);
+        assert_eq!(metadata_from_exec3.len(), 1);
+        assert_eq!(metadata_from_prep.len(), 1);
+        assert_eq!(metadata_from_prep[0].0, "?");
+        assert!(
+            metadata_from_prep[0].1 == ColumnType::MYSQL_TYPE_NULL
+                || metadata_from_prep[0].1 == ColumnType::MYSQL_TYPE_VAR_STRING,
+            "Expected MYSQL_TYPE_NULL(MariaDB) or MYSQL_TYPE_VAR_STRING(MySQL), got {:?}",
+            metadata_from_prep[0].1
+        );
+        assert_eq!(metadata_from_exec1[0].0, "?");
+        assert_eq!(metadata_from_exec1[0].1, ColumnType::MYSQL_TYPE_LONGLONG);
+        assert_eq!(metadata_from_exec2[0].0, "?");
+        assert_eq!(metadata_from_exec2[0].1, ColumnType::MYSQL_TYPE_LONGLONG);
+        assert_eq!(metadata_from_exec3[0].0, "?");
+        assert_eq!(metadata_from_exec3[0].1, ColumnType::MYSQL_TYPE_VAR_STRING);
+
+        assert_eq!(fetched_rows[0], 12);
+        assert_eq!(fetched_rows2[0], 42);
+        assert_eq!(fetched_rows3[0], "foo".to_owned());
     }
 
     #[cfg(feature = "nightly")]

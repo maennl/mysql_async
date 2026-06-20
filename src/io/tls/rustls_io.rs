@@ -3,13 +3,12 @@ use std::sync::Arc;
 use rustls::{
     client::{
         danger::{ServerCertVerified, ServerCertVerifier},
-        WebPkiServerVerifier,
+        Resumption, WebPkiServerVerifier,
     },
-    pki_types::{CertificateDer, ServerName},
+    pki_types::{pem, CertificateDer, ServerName},
     ClientConfig, RootCertStore,
 };
 
-use rustls_pemfile::certs;
 pub(crate) use tokio_rustls::TlsConnector;
 
 use crate::{io::Endpoint, Result, SslOpts, TlsError};
@@ -21,7 +20,7 @@ impl SslOpts {
         for root_cert in self.root_certs() {
             let root_cert_data = root_cert.read().await?;
             let mut seen = false;
-            for cert in certs(&mut &*root_cert_data) {
+            for cert in pem::SliceIter::<CertificateDer<'_>>::new(&root_cert_data) {
                 seen = true;
                 output.push(cert?);
             }
@@ -52,6 +51,10 @@ impl SslOpts {
         } else {
             config_builder.with_no_client_auth()
         };
+
+        if self.disable_tls_resumption() {
+            config.resumption = Resumption::disabled();
+        }
 
         let mut dangerous = config.dangerous();
         let web_pki_verifier = WebPkiServerVerifier::builder(Arc::new(root_store))
